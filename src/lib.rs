@@ -1,15 +1,14 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::tasks::prelude::*;
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
 
 const VIEWPORT_RATIO: UVec2 = uvec2(16, 9);
 const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
-const FIELD_SIZE: UVec2 = uvec2(64 * 16, 64 * 9);
+const FIELD_SIZE: UVec2 = uvec2(32 * 16, 32 * 9);
 const FIELD_WIDTH: usize = FIELD_SIZE.x as usize;
 const FIELD_HEIGHT: usize = FIELD_SIZE.y as usize;
 const FIELD_GENERATION_STEPS: usize = 1000;
@@ -34,7 +33,6 @@ pub fn app() {
             Update,
             update_camera.run_if(on_message::<bevy::window::WindowResized>),
         )
-        .add_systems(Startup, generate_field)
         .add_systems(Startup, setup_loading_screen)
         .add_systems(
             Update,
@@ -57,8 +55,7 @@ struct ProgressBar;
 #[derive(Component)]
 struct Loading;
 
-#[derive(Resource)]
-struct LoadingState(Arc<Mutex<Option<LoadingMessage>>>);
+static LOADING_STATE: Mutex<Option<LoadingMessage>> = Mutex::new(None);
 
 enum LoadingMessage {
     Loading(f32),
@@ -101,67 +98,62 @@ fn calculate_viewport(window: &Window) -> bevy::camera::Viewport {
     }
 }
 
-fn generate_field(mut commands: Commands) {
-    let loading_state = Arc::new(Mutex::new(Some(LoadingMessage::Loading(0.0))));
-    commands.insert_resource(LoadingState(loading_state.clone()));
-    let pool = AsyncComputeTaskPool::get();
-    pool.spawn(async move {
-        let mut rng = StdRng::from_seed([0; 32]);
-        let mut values: Vec<Vec<[f64; 3]>> = (0..FIELD_HEIGHT)
-            .map(|_| (0..FIELD_WIDTH).map(|_| rng.random()).collect())
-            .collect();
-        for step in 0..FIELD_GENERATION_STEPS {
-            values = (0..FIELD_HEIGHT)
-                .map(|i| {
-                    let up = if i == 0 { FIELD_HEIGHT - 1 } else { i - 1 };
-                    let down = if i == FIELD_HEIGHT - 1 { 0 } else { i + 1 };
-                    (0..FIELD_WIDTH)
-                        .map(|j| {
-                            let left = if j == 0 { FIELD_WIDTH - 1 } else { j - 1 };
-                            let right = if j == FIELD_WIDTH - 1 { 0 } else { j + 1 };
-                            let mut next_values = values[i][j];
-                            for k in 0..3 {
-                                next_values[k] += 0.4 * values[i][left][k];
-                                next_values[k] += 0.4 * values[i][right][k];
-                                next_values[k] += 0.4 * values[up][j][k];
-                                next_values[k] += 0.4 * values[down][j][k];
-                                next_values[k] += 0.1 * values[up][left][k];
-                                next_values[k] += 0.1 * values[up][right][k];
-                                next_values[k] += 0.1 * values[down][left][k];
-                                next_values[k] += 0.1 * values[down][right][k];
-                                next_values[k] /= 3.0;
-                            }
-                            for (k1, k2) in [(0, 1), (1, 2), (2, 0)] {
-                                let reaction = 0.01
-                                    * values[i][j][k1]
-                                    * values[i][j][k2]
-                                    * (values[i][j][k1] - values[i][j][k2]);
-                                next_values[k1] += reaction;
-                                next_values[k2] -= reaction;
-                            }
-                            next_values
-                        })
-                        .collect()
-                })
-                .collect();
-            *loading_state.lock().unwrap() = Some(LoadingMessage::Loading(
-                step as f32 / FIELD_GENERATION_STEPS as f32,
-            ));
-        }
-        let field: Vec<Vec<u8>> = values
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|cell| {
-                        let max = cell.into_iter().reduce(f64::max).unwrap();
-                        cell.iter().position(|&value| value == max).unwrap_or(0) as u8
+#[wasm_bindgen]
+pub fn generate_field() {
+    let mut rng = StdRng::from_seed([0; 32]);
+    let mut values: Vec<Vec<[f64; 3]>> = (0..FIELD_HEIGHT)
+        .map(|_| (0..FIELD_WIDTH).map(|_| rng.random()).collect())
+        .collect();
+    for step in 0..FIELD_GENERATION_STEPS {
+        values = (0..FIELD_HEIGHT)
+            .map(|i| {
+                let up = if i == 0 { FIELD_HEIGHT - 1 } else { i - 1 };
+                let down = if i == FIELD_HEIGHT - 1 { 0 } else { i + 1 };
+                (0..FIELD_WIDTH)
+                    .map(|j| {
+                        let left = if j == 0 { FIELD_WIDTH - 1 } else { j - 1 };
+                        let right = if j == FIELD_WIDTH - 1 { 0 } else { j + 1 };
+                        let mut next_values = values[i][j];
+                        for k in 0..3 {
+                            next_values[k] += 0.4 * values[i][left][k];
+                            next_values[k] += 0.4 * values[i][right][k];
+                            next_values[k] += 0.4 * values[up][j][k];
+                            next_values[k] += 0.4 * values[down][j][k];
+                            next_values[k] += 0.1 * values[up][left][k];
+                            next_values[k] += 0.1 * values[up][right][k];
+                            next_values[k] += 0.1 * values[down][left][k];
+                            next_values[k] += 0.1 * values[down][right][k];
+                            next_values[k] /= 3.0;
+                        }
+                        for (k1, k2) in [(0, 1), (1, 2), (2, 0)] {
+                            let reaction = 0.01
+                                * values[i][j][k1]
+                                * values[i][j][k2]
+                                * (values[i][j][k1] - values[i][j][k2]);
+                            next_values[k1] += reaction;
+                            next_values[k2] -= reaction;
+                        }
+                        next_values
                     })
                     .collect()
             })
             .collect();
-        *loading_state.lock().unwrap() = Some(LoadingMessage::Ready { field });
-    })
-    .detach();
+        *LOADING_STATE.lock().unwrap() = Some(LoadingMessage::Loading(
+            step as f32 / FIELD_GENERATION_STEPS as f32,
+        ));
+    }
+    let field: Vec<Vec<u8>> = values
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    let max = cell.into_iter().reduce(f64::max).unwrap();
+                    cell.iter().position(|&value| value == max).unwrap_or(0) as u8
+                })
+                .collect()
+        })
+        .collect();
+    *LOADING_STATE.lock().unwrap() = Some(LoadingMessage::Ready { field });
 }
 
 fn setup_loading_screen(
@@ -201,9 +193,8 @@ fn setup_loading_screen(
 fn update_loading_screen(
     mut commands: Commands,
     mut progress_bar: Single<&mut Transform, With<ProgressBar>>,
-    loading_state: Res<LoadingState>,
 ) {
-    let loading_message = match loading_state.0.try_lock() {
+    let loading_message = match LOADING_STATE.try_lock() {
         Ok(ref mut message) => message.take(),
         Err(_) => return,
     };

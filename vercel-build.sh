@@ -1,5 +1,7 @@
-rustup default 1.97.1
+rustup default nightly
 rustup target add wasm32-unknown-unknown
-curl https://wasm-bindgen.github.io/wasm-pack/installer/init.sh -sSf | sh -s -- -y
-wasm-pack build --target web
+cargo install wasm-bindgen-cli
+cargo build --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/survivors_like.wasm
+npm install
 npm run build
