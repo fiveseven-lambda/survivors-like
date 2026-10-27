@@ -13,11 +13,12 @@ const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
 const FIELD_SIZE: UVec2 = uvec2(64 * 16, 64 * 9);
 const FIELD_WIDTH: usize = FIELD_SIZE.x as usize;
 const FIELD_HEIGHT: usize = FIELD_SIZE.y as usize;
-const FIELD_GENERATION_STEPS: usize = 100;
-const RESOURCE_COLORS: [Color; 3] = [
-    Color::hsv(120.0, 0.6, 0.8),
-    Color::hsv(210.0, 0.6, 0.8),
-    Color::hsv(340.0, 0.6, 0.8),
+const FIELD_GENERATION_STEPS: usize = 256;
+const RESOURCE_COLORS: [Color; 4] = [
+    Color::hsv(60.0, 0.6, 0.8),
+    Color::hsv(160.0, 0.6, 0.8),
+    Color::hsv(220.0, 0.6, 0.8),
+    Color::hsv(320.0, 0.6, 0.8),
 ];
 
 #[wasm_bindgen]
@@ -108,10 +109,7 @@ fn calculate_viewport(window: &Window) -> bevy::camera::Viewport {
 async fn generate_field() {
     let mut rng = StdRng::from_seed(seed());
     let initial_values: Vec<[f32; 4]> = (0..FIELD_HEIGHT * FIELD_WIDTH)
-        .map(|_| {
-            let [x, y, z] = rng.random();
-            [x, y, z, 0.0]
-        })
+        .map(|_| rng.random())
         .collect();
     let instance = wgpu::Instance::default();
     let adapter = instance
@@ -186,7 +184,6 @@ async fn generate_field() {
     let field: Vec<u8> = values
         .iter()
         .map(|cell| {
-            let cell = &cell[..3];
             let max = cell.iter().copied().fold(f32::NAN, f32::max);
             cell.iter().position(|&value| value == max).unwrap_or(0) as u8
         })

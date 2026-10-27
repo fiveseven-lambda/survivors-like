@@ -28,12 +28,16 @@ fn main(
     next_cell += prev_field[below * WIDTH + right];
     next_cell /= 30;
 
-    let xy = 0.01 * prev_cell.x * prev_cell.y * (prev_cell.x - prev_cell.y);
-    let yz = 0.01 * prev_cell.y * prev_cell.z * (prev_cell.y - prev_cell.z);
-    let zx = 0.01 * prev_cell.z * prev_cell.x * (prev_cell.z - prev_cell.x);
-    next_cell.x += xy - zx;
-    next_cell.y += yz - xy;
-    next_cell.z += zx - yz;
+    let xy = 0.3 * prev_cell.x * prev_cell.y * (prev_cell.x - prev_cell.y);
+    let xz = 0.3 * prev_cell.x * prev_cell.z * (prev_cell.x - prev_cell.z);
+    let xw = 0.3 * prev_cell.x * prev_cell.w * (prev_cell.x - prev_cell.w);
+    let yz = 0.3 * prev_cell.y * prev_cell.z * (prev_cell.y - prev_cell.z);
+    let yw = 0.3 * prev_cell.y * prev_cell.w * (prev_cell.y - prev_cell.w);
+    let zw = 0.3 * prev_cell.z * prev_cell.w * (prev_cell.z - prev_cell.w);
+    next_cell.x += xy + xz + xw;
+    next_cell.y += -xy + yz + yw;
+    next_cell.z += -xz - yz + zw;
+    next_cell.w += -xw - yw - zw;
 
     next_field[row * WIDTH + column] = next_cell;
 }
