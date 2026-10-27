@@ -44,6 +44,22 @@ pub fn app() {
         .run();
 }
 
+#[cfg(target_family = "wasm")]
+fn seed() -> [u8; 32] {
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = Math)]
+        fn random() -> f64;
+    }
+
+    std::array::from_fn(|_| (random() * 256.0).floor() as u8)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn seed() -> [u8; 32] {
+    rand::random()
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug, States)]
 enum State {
     Loading,
@@ -90,7 +106,7 @@ fn calculate_viewport(window: &Window) -> bevy::camera::Viewport {
 }
 
 async fn generate_field() {
-    let mut rng = StdRng::from_seed([0; 32]);
+    let mut rng = StdRng::from_seed(seed());
     let initial_values: Vec<[f32; 4]> = (0..FIELD_HEIGHT * FIELD_WIDTH)
         .map(|_| {
             let [x, y, z] = rng.random();
