@@ -3,15 +3,17 @@ use std::sync::Mutex;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::tasks::prelude::*;
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
+use wgpu::util::DeviceExt;
 
 const VIEWPORT_RATIO: UVec2 = uvec2(16, 9);
 const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
-const FIELD_SIZE: UVec2 = uvec2(32 * 16, 32 * 9);
+const FIELD_SIZE: UVec2 = uvec2(64 * 16, 64 * 9);
 const FIELD_WIDTH: usize = FIELD_SIZE.x as usize;
 const FIELD_HEIGHT: usize = FIELD_SIZE.y as usize;
-const FIELD_GENERATION_STEPS: usize = 1000;
+const FIELD_GENERATION_STEPS: usize = 100;
 const RESOURCE_COLORS: [Color; 3] = [
     Color::hsv(120.0, 0.6, 0.8),
     Color::hsv(210.0, 0.6, 0.8),
@@ -28,12 +30,11 @@ pub fn app() {
             }),
             ..default()
         }))
-        .add_systems(Startup, setup_camera)
+        .add_systems(Startup, setup)
         .add_systems(
             Update,
             update_camera.run_if(on_message::<bevy::window::WindowResized>),
         )
-        .add_systems(Startup, setup_loading_screen)
         .add_systems(
             Update,
             update_loading_screen.run_if(in_state(State::Loading)),
@@ -49,23 +50,12 @@ enum State {
     Paused,
 }
 
-#[derive(Component)]
-struct ProgressBar;
-
-#[derive(Component)]
-struct Loading;
-
-static LOADING_STATE: Mutex<Option<LoadingMessage>> = Mutex::new(None);
-
-enum LoadingMessage {
-    Loading(f32),
-    Ready { field: Vec<Vec<u8>> },
-}
+static FIELD: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 #[derive(Resource)]
-struct Field(Vec<Vec<u8>>);
+struct Field(Vec<u8>);
 
-fn setup_camera(mut commands: Commands, window: Single<&Window>) {
+fn setup(mut commands: Commands, window: Single<&Window>) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -80,6 +70,7 @@ fn setup_camera(mut commands: Commands, window: Single<&Window>) {
             ..OrthographicProjection::default_2d()
         }),
     ));
+    AsyncComputeTaskPool::get().spawn(generate_field()).detach();
 }
 
 fn update_camera(mut camera: Single<&mut Camera>, window: Single<&Window>) {
@@ -98,140 +89,120 @@ fn calculate_viewport(window: &Window) -> bevy::camera::Viewport {
     }
 }
 
-#[wasm_bindgen]
-pub fn generate_field() {
+async fn generate_field() {
     let mut rng = StdRng::from_seed([0; 32]);
-    let mut values: Vec<Vec<[f64; 3]>> = (0..FIELD_HEIGHT)
-        .map(|_| (0..FIELD_WIDTH).map(|_| rng.random()).collect())
-        .collect();
-    for step in 0..FIELD_GENERATION_STEPS {
-        values = (0..FIELD_HEIGHT)
-            .map(|i| {
-                let up = if i == 0 { FIELD_HEIGHT - 1 } else { i - 1 };
-                let down = if i == FIELD_HEIGHT - 1 { 0 } else { i + 1 };
-                (0..FIELD_WIDTH)
-                    .map(|j| {
-                        let left = if j == 0 { FIELD_WIDTH - 1 } else { j - 1 };
-                        let right = if j == FIELD_WIDTH - 1 { 0 } else { j + 1 };
-                        let mut next_values = values[i][j];
-                        for k in 0..3 {
-                            next_values[k] += 0.4 * values[i][left][k];
-                            next_values[k] += 0.4 * values[i][right][k];
-                            next_values[k] += 0.4 * values[up][j][k];
-                            next_values[k] += 0.4 * values[down][j][k];
-                            next_values[k] += 0.1 * values[up][left][k];
-                            next_values[k] += 0.1 * values[up][right][k];
-                            next_values[k] += 0.1 * values[down][left][k];
-                            next_values[k] += 0.1 * values[down][right][k];
-                            next_values[k] /= 3.0;
-                        }
-                        for (k1, k2) in [(0, 1), (1, 2), (2, 0)] {
-                            let reaction = 0.01
-                                * values[i][j][k1]
-                                * values[i][j][k2]
-                                * (values[i][j][k1] - values[i][j][k2]);
-                            next_values[k1] += reaction;
-                            next_values[k2] -= reaction;
-                        }
-                        next_values
-                    })
-                    .collect()
-            })
-            .collect();
-        *LOADING_STATE.lock().unwrap() = Some(LoadingMessage::Loading(
-            step as f32 / FIELD_GENERATION_STEPS as f32,
-        ));
-    }
-    let field: Vec<Vec<u8>> = values
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|cell| {
-                    let max = cell.into_iter().reduce(f64::max).unwrap();
-                    cell.iter().position(|&value| value == max).unwrap_or(0) as u8
-                })
-                .collect()
+    let initial_values: Vec<[f32; 4]> = (0..FIELD_HEIGHT * FIELD_WIDTH)
+        .map(|_| {
+            let [x, y, z] = rng.random();
+            [x, y, z, 0.0]
         })
         .collect();
-    *LOADING_STATE.lock().unwrap() = Some(LoadingMessage::Ready { field });
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await
+        .unwrap();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor::default())
+        .await
+        .unwrap();
+    let module = device.create_shader_module(wgpu::include_wgsl!("generate_field.wgsl"));
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &module,
+        entry_point: None,
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&initial_values),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let buffers = [
+        &buffer,
+        &device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: buffer.size(),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        }),
+    ];
+    let bind_groups: [_; 2] = std::array::from_fn(|parity| {
+        let entries: [_; 2] = std::array::from_fn(|binding| wgpu::BindGroupEntry {
+            binding: binding as u32,
+            resource: buffers[parity ^ binding].as_entire_binding(),
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        })
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        for _ in 0..FIELD_GENERATION_STEPS {
+            for bind_group in &bind_groups {
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(FIELD_SIZE.x / 16, FIELD_SIZE.y / 16, 1);
+            }
+        }
+    }
+    let staging_buffer = device.create_buffer(&wgpu::wgt::BufferDescriptor {
+        label: None,
+        size: buffer.size(),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(&buffer, 0, &staging_buffer, 0, buffer.size());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    encoder.map_buffer_on_submit(&staging_buffer, wgpu::MapMode::Read, .., |result| {
+        tx.send(result).unwrap();
+    });
+    queue.submit([encoder.finish()]);
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    rx.await.unwrap().unwrap();
+    let values = staging_buffer.get_mapped_range(..).unwrap();
+    let values: &[[f32; 4]] = bytemuck::cast_slice(&values);
+    let field: Vec<u8> = values
+        .iter()
+        .map(|cell| {
+            let cell = &cell[..3];
+            let max = cell.iter().copied().fold(f32::NAN, f32::max);
+            cell.iter().position(|&value| value == max).unwrap_or(0) as u8
+        })
+        .collect();
+    *FIELD.lock().unwrap() = Some(field);
 }
 
-fn setup_loading_screen(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    let progress_bar = Rectangle::from_size(Vec2::new(56.0, 4.0));
-    let progress_bar_border = progress_bar.to_ring(0.1);
-    let white = materials.add(Color::WHITE);
-    commands.spawn((
-        ProgressBar,
-        Loading,
-        Mesh2d(meshes.add(progress_bar)),
-        MeshMaterial2d(white.clone()),
-        Transform {
-            translation: Vec3 {
-                x: -28.0,
-                y: 0.0,
-                z: -1.0,
-            },
-            rotation: Quat::IDENTITY,
-            scale: Vec3 {
-                x: 0.0,
-                y: 1.0,
-                z: 1.0,
-            },
-        },
-    ));
-    commands.spawn((
-        Loading,
-        Mesh2d(meshes.add(progress_bar_border)),
-        MeshMaterial2d(white.clone()),
-    ));
-}
-
-fn update_loading_screen(
-    mut commands: Commands,
-    mut progress_bar: Single<&mut Transform, With<ProgressBar>>,
-) {
-    let loading_message = match LOADING_STATE.try_lock() {
+fn update_loading_screen(mut commands: Commands) {
+    let field = match FIELD.try_lock() {
         Ok(ref mut message) => message.take(),
         Err(_) => return,
     };
-    let Some(loading_message) = loading_message else {
+    let Some(field) = field else {
         return;
     };
-    match loading_message {
-        LoadingMessage::Loading(progress) => {
-            progress_bar.translation.x = 28.0 * (progress - 1.0);
-            progress_bar.scale.x = progress;
-        }
-        LoadingMessage::Ready { field } => {
-            commands.set_state(State::Paused);
-            commands.insert_resource(Field(field));
-        }
-    }
+    commands.set_state(State::Paused);
+    commands.insert_resource(Field(field));
 }
 
 fn setup_title_screen(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    loading: Query<Entity, With<Loading>>,
     field: Res<Field>,
 ) {
-    for entity in loading {
-        commands.entity(entity).despawn();
-    }
     let mut field_image_data = Vec::new();
-    for row in field.0.iter().rev() {
-        for &cell in row {
-            field_image_data.extend(RESOURCE_COLORS[cell as usize].to_linear().to_u8_array());
-        }
+    for &cell in &field.0 {
+        field_image_data.extend(RESOURCE_COLORS[cell as usize].to_linear().to_u8_array());
     }
     let mut field_image = Image::new(
         Extent3d {
-            height: FIELD_HEIGHT as u32,
-            width: FIELD_WIDTH as u32,
+            height: FIELD_SIZE.y,
+            width: FIELD_SIZE.x,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,

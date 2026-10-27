@@ -1,8 +1,4 @@
-rustup default nightly
-rustup component add rust-src --toolchain nightly
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli
-cargo build --target wasm32-unknown-unknown --release
-wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/survivors_like.wasm
+curl https://wasm-bindgen.github.io/wasm-pack/installer/init.sh -sSf | sh
+wasm-pack build --target web
 npm install
 npm run build
