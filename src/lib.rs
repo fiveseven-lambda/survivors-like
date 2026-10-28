@@ -3,10 +3,12 @@ use std::sync::Mutex;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::tasks::prelude::*;
+use parry2d::bounding_volume::Aabb;
+use parry2d::partitioning::{Bvh, BvhWorkspace};
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
-use wgpu::util::DeviceExt;
 
 const VIEWPORT_RATIO: UVec2 = uvec2(16, 9);
 const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
@@ -36,14 +38,27 @@ pub fn app() {
             Update,
             update_camera.run_if(on_message::<bevy::window::WindowResized>),
         )
+        .add_systems(OnEnter(State::Loading), setup_loading_screen)
         .add_systems(
             Update,
             update_loading_screen.run_if(in_state(State::Loading)),
         )
-        .add_systems(OnExit(State::Loading), setup_title_screen)
+        .add_systems(OnEnter(State::Title), setup_title_screen)
+        .add_systems(Update, update_title_screen.run_if(in_state(State::Title)))
+        .add_systems(OnEnter(State::Running), start)
+        .add_systems(
+            Update,
+            update_direction.run_if(in_state(State::Running).and_then(on_message::<CursorMoved>)),
+        )
+        .add_systems(Update, move_player.run_if(in_state(State::Running)))
+        .add_systems(Update, update.run_if(in_state(State::Running)))
+        .add_systems(Update, spawn_enemies.run_if(in_state(State::Running)))
         .insert_state(State::Loading)
         .run();
 }
+
+#[derive(Resource)]
+struct RandomSource(StdRng);
 
 #[cfg(target_family = "wasm")]
 fn seed() -> [u8; 32] {
@@ -64,15 +79,72 @@ fn seed() -> [u8; 32] {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, States)]
 enum State {
     Loading,
-    Paused,
+    Title,
+    Running,
+    Result,
 }
+
+#[derive(Component)]
+struct Title;
 
 static FIELD: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
 #[derive(Resource)]
 struct Field(Vec<u8>);
 
-fn setup(mut commands: Commands, window: Single<&Window>) {
+#[derive(Component)]
+struct PlayerTriangle(Triangle, f32);
+
+enum Triangle {
+    Inner,
+    Outer,
+}
+
+#[derive(Resource)]
+struct PlayerVelocity {
+    direction: Vec2,
+    speed: f32,
+    velocity: Vec2,
+}
+
+#[derive(Resource)]
+struct PlayerPosition(Vec2);
+
+#[derive(Resource)]
+struct Player {
+    health: f32,
+    max_health: f32,
+}
+
+#[derive(Component)]
+struct EnemySource {
+    radius: f32,
+    health: u32,
+    timer: std::time::Duration,
+    interval: std::time::Duration,
+    stroke: Handle<Mesh>,
+    stroke_color: Handle<ColorMaterial>,
+}
+
+#[derive(Component)]
+struct Enemy {
+    radius: f32,
+    health: u32,
+}
+
+#[derive(Resource)]
+struct EnemiesBvh {
+    bvh: Bvh,
+    workspace: BvhWorkspace,
+    optimization_counter: u32,
+}
+
+fn setup(
+    mut commands: Commands,
+    window: Single<&Window>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -87,7 +159,9 @@ fn setup(mut commands: Commands, window: Single<&Window>) {
             ..OrthographicProjection::default_2d()
         }),
     ));
-    AsyncComputeTaskPool::get().spawn(generate_field()).detach();
+    let mut rng = StdRng::from_seed(seed());
+    generate_field(&device, &queue, &mut rng);
+    commands.insert_resource(RandomSource(rng));
 }
 
 fn update_camera(mut camera: Single<&mut Camera>, window: Single<&Window>) {
@@ -106,21 +180,12 @@ fn calculate_viewport(window: &Window) -> bevy::camera::Viewport {
     }
 }
 
-async fn generate_field() {
-    let mut rng = StdRng::from_seed(seed());
+fn generate_field(device: &RenderDevice, queue: &RenderQueue, rng: &mut StdRng) {
     let initial_values: Vec<[f32; 4]> = (0..FIELD_HEIGHT * FIELD_WIDTH)
         .map(|_| rng.random())
         .collect();
-    let instance = wgpu::Instance::default();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .unwrap();
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
-        .await
-        .unwrap();
-    let module = device.create_shader_module(wgpu::include_wgsl!("generate_field.wgsl"));
+    let module =
+        device.create_and_validate_shader_module(wgpu::include_wgsl!("generate_field.wgsl"));
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: None,
@@ -129,7 +194,7 @@ async fn generate_field() {
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let buffer = device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&initial_values),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
@@ -148,11 +213,7 @@ async fn generate_field() {
             binding: binding as u32,
             resource: buffers[parity ^ binding].as_entire_binding(),
         });
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        })
+        device.create_bind_group(None, &pipeline.get_bind_group_layout(0).into(), &entries)
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
@@ -178,17 +239,34 @@ async fn generate_field() {
     });
     queue.submit([encoder.finish()]);
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    rx.await.unwrap().unwrap();
-    let values = staging_buffer.get_mapped_range(..).unwrap();
-    let values: &[[f32; 4]] = bytemuck::cast_slice(&values);
-    let field: Vec<u8> = values
-        .iter()
-        .map(|cell| {
-            let max = cell.iter().copied().fold(f32::NAN, f32::max);
-            cell.iter().position(|&value| value == max).unwrap_or(0) as u8
+    AsyncComputeTaskPool::get()
+        .spawn(async move {
+            rx.await.unwrap().unwrap();
+            let values = staging_buffer.get_mapped_range(..).unwrap();
+            let values: &[[f32; 4]] = bytemuck::cast_slice(&values);
+            let field = values
+                .iter()
+                .map(|cell| {
+                    let max = cell.iter().copied().fold(f32::NAN, f32::max);
+                    cell.iter().position(|&value| value == max).unwrap_or(0) as u8
+                })
+                .collect();
+            *FIELD.lock().unwrap() = Some(field);
         })
-        .collect();
-    *FIELD.lock().unwrap() = Some(field);
+        .detach();
+}
+
+fn setup_loading_screen(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    commands.spawn((
+        Title,
+        Mesh2d(meshes.add(Rectangle::from_size(VIEW_SIZE))),
+        MeshMaterial2d(materials.add(Color::hsva(0.0, 0.0, 0.0, 0.8))),
+        Transform::from_xyz(0.0, 0.0, 1.0),
+    ));
 }
 
 fn update_loading_screen(mut commands: Commands) {
@@ -199,13 +277,15 @@ fn update_loading_screen(mut commands: Commands) {
     let Some(field) = field else {
         return;
     };
-    commands.set_state(State::Paused);
+    commands.set_state(State::Title);
     commands.insert_resource(Field(field));
 }
 
 fn setup_title_screen(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     field: Res<Field>,
 ) {
     let mut field_image_data = Vec::new();
@@ -229,4 +309,262 @@ fn setup_title_screen(
     let mut field_sprite = Sprite::from_image(images.add(field_image));
     field_sprite.rect = Some(Rect::from_center_size(Vec2::ZERO, VIEW_SIZE));
     commands.spawn((field_sprite, Transform::from_xyz(0.0, 0.0, -1.0)));
+
+    let player_radius = 1.0;
+    let player_resolution = 32;
+    let player_color = materials.add(Color::WHITE);
+    let theta = std::f32::consts::PI / player_resolution as f32;
+    let inner_radius = 0.0;
+    let (sin, cos) = f32::sin_cos(theta);
+    let inner_triangle = meshes.add(Triangle2d::new(
+        Vec2::new(0.0, 0.0),
+        Vec2::new(-player_radius, -player_radius * sin),
+        Vec2::new(-player_radius, player_radius * sin),
+    ));
+    for i in 0..player_resolution {
+        let angle = (2 * i) as f32 * theta;
+        let rotation = Quat::from_rotation_z(angle);
+        let translation = player_radius * Vec2::from_angle(angle);
+        commands.spawn((
+            PlayerTriangle(Triangle::Inner, cos),
+            Mesh2d(inner_triangle.clone()),
+            MeshMaterial2d(player_color.clone()),
+            Transform {
+                scale: Vec3::new(1.0 - inner_radius * cos, inner_radius, 1.0),
+                rotation,
+                translation: translation.extend(0.0),
+            },
+        ));
+    }
+    let outer_triangle = meshes.add(Triangle2d::new(
+        Vec2::new(-player_radius, 0.0),
+        Vec2::new(0.0, -player_radius * sin),
+        Vec2::new(0.0, player_radius * sin),
+    ));
+    for i in 0..player_resolution {
+        let angle = (2 * i + 1) as f32 * theta;
+        let rotation = Quat::from_rotation_z(angle);
+        let translation = player_radius * cos * Vec2::from_angle(angle);
+        commands.spawn((
+            PlayerTriangle(Triangle::Outer, cos),
+            Mesh2d(outer_triangle.clone()),
+            MeshMaterial2d(player_color.clone()),
+            Transform {
+                scale: Vec3::new(cos - inner_radius, 1.0, 1.0),
+                rotation,
+                translation: translation.extend(0.0),
+            },
+        ));
+    }
+
+    commands.spawn((
+        Title,
+        Text2d(String::from("Click anywhere to start")),
+        TextFont {
+            font_size: FontSize::from(64.0),
+            ..default()
+        },
+        Transform {
+            translation: Vec2::ZERO.extend(1.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec2::splat(1.0 / 16.0).extend(1.0),
+        },
+    ));
+}
+
+fn update_title_screen(
+    mut mouse_button_inputs: MessageReader<bevy::input::mouse::MouseButtonInput>,
+    mut next_state: ResMut<NextState<State>>,
+) {
+    for input in mouse_button_inputs.read() {
+        if input.button == MouseButton::Left && input.state == bevy::input::ButtonState::Released {
+            next_state.set(State::Running);
+        }
+    }
+}
+
+fn start(
+    mut commands: Commands,
+    title: Query<Entity, With<Title>>,
+    window: Single<&Window>,
+    camera: Single<(&Camera, &GlobalTransform)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    for entity in title {
+        commands.entity(entity).despawn();
+    }
+    let direction = calculate_direction(*window, *camera).unwrap_or(Vec2::X);
+    let speed = 10.0;
+    commands.insert_resource(PlayerVelocity {
+        direction,
+        speed,
+        velocity: direction.normalize_or(Vec2::X) * speed,
+    });
+    commands.insert_resource(PlayerPosition(Vec2::ZERO));
+    commands.insert_resource(Player {
+        health: 1.0,
+        max_health: 1.0,
+    });
+    commands.spawn(EnemySource {
+        radius: 0.6,
+        health: 20,
+        timer: std::time::Duration::ZERO,
+        interval: std::time::Duration::from_millis(2000),
+        stroke: meshes.add(Circle::new(0.6).to_ring(0.1)),
+        stroke_color: materials.add(Color::BLACK),
+    });
+
+    commands.spawn(EnemySource {
+        radius: 0.4,
+        health: 10,
+        timer: std::time::Duration::ZERO,
+        interval: std::time::Duration::from_millis(500),
+        stroke: meshes.add(Circle::new(0.4).to_ring(0.1)),
+        stroke_color: materials.add(Color::BLACK),
+    });
+
+    commands.insert_resource(EnemiesBvh {
+        bvh: Bvh::new(),
+        workspace: BvhWorkspace::default(),
+        optimization_counter: 0,
+    });
+}
+
+fn update_direction(
+    mut player: ResMut<PlayerVelocity>,
+    window: Single<&Window>,
+    camera: Single<(&Camera, &GlobalTransform)>,
+) {
+    if let Some(direction) = calculate_direction(*window, *camera) {
+        player.direction = direction;
+        player.velocity = direction.normalize_or(Vec2::X) * player.speed;
+    }
+}
+
+fn calculate_direction(
+    window: &Window,
+    (camera, camera_transform): (&Camera, &GlobalTransform),
+) -> Option<Vec2> {
+    let cursor_position = window.cursor_position()?;
+    camera
+        .viewport_to_world_2d(camera_transform, cursor_position)
+        .ok()
+}
+
+fn move_player(
+    mut player_position: ResMut<PlayerPosition>,
+    mut background: Single<&mut Sprite>,
+    player_velocity: Res<PlayerVelocity>,
+    time: Res<Time>,
+) {
+    let pos_float = player_position.0 + player_velocity.velocity * time.delta_secs();
+    let pos_int = pos_float.as_ivec2();
+    let field_size = FIELD_SIZE.as_ivec2();
+    let q = pos_int.div_euclid(field_size) * field_size;
+    player_position.0 = pos_float - q.as_vec2();
+    background.rect = Some(Rect::from_center_size(
+        Vec2 {
+            x: player_position.0.x,
+            y: -player_position.0.y,
+        },
+        VIEW_SIZE,
+    ));
+}
+
+fn update(
+    mut commands: Commands,
+    mut next_state: ResMut<NextState<State>>,
+    mut enemies: Query<(Entity, &Enemy, &mut Transform), Without<PlayerTriangle>>,
+    mut enemies_bvh: ResMut<EnemiesBvh>,
+    mut player: ResMut<Player>,
+    player_triangles: Query<(&PlayerTriangle, &mut Transform), Without<Enemy>>,
+    player_velocity: Res<PlayerVelocity>,
+    time: Res<Time>,
+) {
+    for (entity, enemy, mut transform) in &mut enemies {
+        let radius = enemy.radius;
+        let old_pos = transform.translation.truncate();
+        let old_aabb = Aabb::new(old_pos - Vec2::splat(radius), old_pos + Vec2::splat(radius));
+        let mut enemy_velocity = -10.0 * old_pos.normalize_or_zero();
+        {
+            let player_distance_squared = old_pos.length_squared();
+            enemy_velocity *= player_distance_squared - radius * radius;
+            enemy_velocity /= player_distance_squared;
+        }
+        for other_index in enemies_bvh.bvh.intersect_aabb(&old_aabb) {
+            if other_index == entity.index_u32() {
+                continue;
+            }
+            let other_node = enemies_bvh.bvh.leaf_node(other_index).unwrap();
+            let other_radius = (other_node.maxs().x - other_node.mins().x) / 2.0;
+            let sum_radii = radius + other_radius;
+            let diff = old_pos - other_node.center();
+            let enemy_distance_squared = diff.length_squared();
+            if enemy_distance_squared < 1000.0 * sum_radii * sum_radii {
+                enemy_velocity += diff / enemy_distance_squared;
+            }
+        }
+        let new_pos = old_pos + (enemy_velocity - player_velocity.velocity) * time.delta_secs();
+        transform.translation = new_pos.extend(0.0);
+    }
+    for (entity, enemy, transform) in &enemies {
+        if enemy.health == 0 {
+            commands.entity(entity).despawn();
+            enemies_bvh.bvh.remove(entity.index_u32());
+        } else {
+            let size = enemy.radius;
+            let new_pos = transform.translation.truncate();
+            if new_pos.length() < 1.0 {
+                player.health -= time.delta_secs();
+            }
+            let new_aabb = Aabb::new(new_pos - Vec2::splat(size), new_pos + Vec2::splat(size));
+            enemies_bvh.bvh.insert(new_aabb, entity.index_u32());
+        }
+    }
+    if player.health <= 0.0 {
+        next_state.set(State::Result);
+        return;
+    }
+    let inner_radius = 1.0 - player.health / player.max_health;
+    for (PlayerTriangle(triangle, cos), mut transform) in player_triangles {
+        match triangle {
+            Triangle::Inner => {
+                transform.scale.x = 1.0 - inner_radius * cos;
+                transform.scale.y = inner_radius;
+            }
+            Triangle::Outer => {
+                transform.scale.x = cos - inner_radius;
+            }
+        }
+    }
+}
+
+fn spawn_enemies(
+    mut commands: Commands,
+    enemy_sources: Query<&mut EnemySource>,
+    mut enemies_bvh: ResMut<EnemiesBvh>,
+    mut random_source: ResMut<RandomSource>,
+    time: Res<Time>,
+) {
+    for mut enemy_source in enemy_sources {
+        let time = enemy_source.timer + time.delta();
+        let num_enemies = (time.as_nanos() / enemy_source.interval.as_nanos()) as u32;
+        enemy_source.timer = time - num_enemies * enemy_source.interval;
+        let radius = enemy_source.radius;
+        let health = enemy_source.health;
+        for _ in 0..num_enemies {
+            let pos = 40.0 * Vec2::from_angle(random_source.0.random_range(0.0..360.0));
+            let entity = commands.spawn((
+                Enemy { radius, health },
+                Mesh2d(enemy_source.stroke.clone()),
+                MeshMaterial2d(enemy_source.stroke_color.clone()),
+                Transform::from_translation(pos.extend(0.0)),
+            ));
+            enemies_bvh.bvh.insert(
+                Aabb::new(pos - Vec2::splat(radius), pos + Vec2::splat(radius)),
+                entity.id().index_u32(),
+            );
+        }
+    }
 }

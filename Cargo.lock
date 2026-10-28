@@ -2294,7 +2294,7 @@ dependencies = [
  "mach2",
  "ndk",
  "ndk-context",
- "num-derive",
+ "num-derive 0.4.2",
  "num-traits",
  "objc2 0.6.5",
  "objc2-audio-toolbox",
@@ -2485,6 +2485,15 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
+name = "ena"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eabffdaee24bd1bf95c5ef7cec31260444317e72ea56c4c91750e8b7ee58d5f1"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "encase"
@@ -2846,6 +2855,18 @@ dependencies = [
  "libm",
  "rand",
  "serde_core",
+]
+
+[[package]]
+name = "glamx"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d74079318e3a077bd3d15faa90fde24fa37bb9f157f92f853e6019a15fd413"
+dependencies = [
+ "approx",
+ "glam",
+ "num-traits",
+ "simba",
 ]
 
 [[package]]
@@ -3705,6 +3726,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-complex"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "num-derive"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3713,6 +3743,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "num-derive"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4e98dc3b890f6c23a0f9d3d491a2823d0dea0fa656302a13dd225fa924112a8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4249,6 +4290,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "parry2d"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe1ba500175e957aaa27ddc92290ec8ff503d73331365443660816d6302e2a31"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags 2.13.2",
+ "downcast-rs 2.0.2",
+ "either",
+ "ena",
+ "foldhash 0.2.0",
+ "glamx",
+ "hashbrown 0.17.1",
+ "log",
+ "num-derive 0.5.1",
+ "num-traits",
+ "ordered-float",
+ "simba",
+ "slab",
+ "smallvec",
+ "spade",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4566,6 +4633,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "robust"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
+
+[[package]]
 name = "rodio"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4644,6 +4717,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -4746,6 +4828,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "simba"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a7200d82ff1c7b4235efd12f11e2537a402c91cf83a5cb97ce80eef787fde7"
+dependencies = [
+ "approx",
+ "num-complex",
+ "num-traits",
+ "wide",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4833,6 +4927,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spade"
+version = "2.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9699399fd9349b00b184f5635b074f9ec93afffef30c853f8c875b32c0f8c7fa"
+dependencies = [
+ "hashbrown 0.16.1",
+ "num-traits",
+ "robust",
+ "smallvec",
+]
+
+[[package]]
 name = "spin"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4883,6 +4989,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bytemuck",
+ "parry2d",
  "rand",
  "tokio",
  "wasm-bindgen",
@@ -5809,6 +5916,16 @@ dependencies = [
  "half",
  "itertools 0.15.0",
  "num-traits",
+]
+
+[[package]]
+name = "wide"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]

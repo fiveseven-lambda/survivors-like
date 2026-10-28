@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bevy = { version = "0.20.0", default-features = false, features = ["2d"] }
 bytemuck = "1.25.2"
+parry2d = "0.31.1"
 rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }
 tokio = { version = "1.54.1", features = ["sync"] }
 wasm-bindgen = "0.2.129"
