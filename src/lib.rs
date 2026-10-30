@@ -3,12 +3,12 @@ use std::sync::Mutex;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::tasks::prelude::*;
 use parry2d::bounding_volume::Aabb;
 use parry2d::partitioning::{Bvh, BvhWorkspace};
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
+use wgpu::util::DeviceExt;
 
 const VIEWPORT_RATIO: UVec2 = uvec2(16, 9);
 const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
@@ -87,7 +87,7 @@ enum State {
 #[derive(Component)]
 struct Title;
 
-static FIELD: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static FIELD: Mutex<Option<Field>> = Mutex::new(None);
 
 #[derive(Resource)]
 struct Field(Vec<u8>);
@@ -139,12 +139,7 @@ struct EnemiesBvh {
     optimization_counter: u32,
 }
 
-fn setup(
-    mut commands: Commands,
-    window: Single<&Window>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-) {
+fn setup(mut commands: Commands, window: Single<&Window>) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -160,7 +155,12 @@ fn setup(
         }),
     ));
     let mut rng = StdRng::from_seed(seed());
-    generate_field(&device, &queue, &mut rng);
+    let initial_values = (0..FIELD_HEIGHT * FIELD_WIDTH)
+        .map(|_| rng.random())
+        .collect();
+    AsyncComputeTaskPool::get()
+        .spawn(generate_field(initial_values))
+        .detach();
     commands.insert_resource(RandomSource(rng));
 }
 
@@ -180,12 +180,23 @@ fn calculate_viewport(window: &Window) -> bevy::camera::Viewport {
     }
 }
 
-fn generate_field(device: &RenderDevice, queue: &RenderQueue, rng: &mut StdRng) {
-    let initial_values: Vec<[f32; 4]> = (0..FIELD_HEIGHT * FIELD_WIDTH)
-        .map(|_| rng.random())
-        .collect();
-    let module =
-        device.create_and_validate_shader_module(wgpu::include_wgsl!("generate_field.wgsl"));
+async fn generate_field(initial_values: Vec<[f32; 4]>) {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await
+        .unwrap();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor::default())
+        .await
+        .unwrap();
+    let module = device.create_shader_module(wgpu::include_wgsl!("generate_field.wgsl"));
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: None,
@@ -194,7 +205,7 @@ fn generate_field(device: &RenderDevice, queue: &RenderQueue, rng: &mut StdRng) 
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
-    let buffer = device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&initial_values),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
@@ -213,7 +224,11 @@ fn generate_field(device: &RenderDevice, queue: &RenderQueue, rng: &mut StdRng) 
             binding: binding as u32,
             resource: buffers[parity ^ binding].as_entire_binding(),
         });
-        device.create_bind_group(None, &pipeline.get_bind_group_layout(0).into(), &entries)
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        })
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     {
@@ -239,21 +254,17 @@ fn generate_field(device: &RenderDevice, queue: &RenderQueue, rng: &mut StdRng) 
     });
     queue.submit([encoder.finish()]);
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    AsyncComputeTaskPool::get()
-        .spawn(async move {
-            rx.await.unwrap().unwrap();
-            let values = staging_buffer.get_mapped_range(..).unwrap();
-            let values: &[[f32; 4]] = bytemuck::cast_slice(&values);
-            let field = values
-                .iter()
-                .map(|cell| {
-                    let max = cell.iter().copied().fold(f32::NAN, f32::max);
-                    cell.iter().position(|&value| value == max).unwrap_or(0) as u8
-                })
-                .collect();
-            *FIELD.lock().unwrap() = Some(field);
+    rx.await.unwrap().unwrap();
+    let values = staging_buffer.get_mapped_range(..).unwrap();
+    let values: &[[f32; 4]] = bytemuck::cast_slice(&values);
+    let field = values
+        .iter()
+        .map(|cell| {
+            let max = cell.iter().copied().fold(f32::NAN, f32::max);
+            cell.iter().position(|&value| value == max).unwrap_or(0) as u8
         })
-        .detach();
+        .collect();
+    *FIELD.lock().unwrap() = Some(Field(field));
 }
 
 fn setup_loading_screen(
@@ -277,8 +288,8 @@ fn update_loading_screen(mut commands: Commands) {
     let Some(field) = field else {
         return;
     };
+    commands.insert_resource(field);
     commands.set_state(State::Title);
-    commands.insert_resource(Field(field));
 }
 
 fn setup_title_screen(
