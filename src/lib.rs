@@ -1,11 +1,13 @@
 use std::sync::Mutex;
 
+use bevy::ecs::entity::{Entities, EntityIndex};
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::tasks::prelude::*;
 use parry2d::bounding_volume::Aabb;
 use parry2d::partitioning::{Bvh, BvhWorkspace};
+use parry2d::query::PointQuery;
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
 use wgpu::util::DeviceExt;
@@ -15,7 +17,7 @@ const VIEW_SIZE: Vec2 = vec2(64.0, 36.0);
 const FIELD_SIZE: UVec2 = uvec2(64 * 16, 64 * 9);
 const FIELD_WIDTH: usize = FIELD_SIZE.x as usize;
 const FIELD_HEIGHT: usize = FIELD_SIZE.y as usize;
-const FIELD_GENERATION_STEPS: usize = 256;
+const FIELD_GENERATION_STEPS: usize = 1024;
 const RESOURCE_COLORS: [Color; 4] = [
     Color::hsv(60.0, 0.6, 0.8),
     Color::hsv(160.0, 0.6, 0.8),
@@ -51,8 +53,20 @@ pub fn app() {
             update_direction.run_if(in_state(State::Running).and_then(on_message::<CursorMoved>)),
         )
         .add_systems(Update, move_player.run_if(in_state(State::Running)))
-        .add_systems(Update, update.run_if(in_state(State::Running)))
+        .add_systems(Update, update_player.run_if(in_state(State::Running)))
+        .add_systems(
+            Update,
+            (move_enemies, update_enemies)
+                .chain()
+                .run_if(in_state(State::Running)),
+        )
         .add_systems(Update, spawn_enemies.run_if(in_state(State::Running)))
+        .add_systems(Update, move_bullets.run_if(in_state(State::Running)))
+        .add_systems(Update, spawn_bullets.run_if(in_state(State::Running)))
+        .add_systems(OnEnter(State::Result), setup_result_screen)
+        .add_systems(Update, update_result_screen.run_if(in_state(State::Result)))
+        .add_systems(OnExit(State::Result), reset)
+        .insert_resource(RandomSource(StdRng::from_seed(seed())))
         .insert_state(State::Loading)
         .run();
 }
@@ -133,13 +147,31 @@ struct Enemy {
 }
 
 #[derive(Resource)]
-struct EnemiesBvh {
-    bvh: Bvh,
+struct EnemiesBvh(Bvh);
+
+#[derive(Resource)]
+struct EnemiesBvhOptimizer {
     workspace: BvhWorkspace,
-    optimization_counter: u32,
+    counter: u32,
 }
 
-fn setup(mut commands: Commands, window: Single<&Window>) {
+#[derive(Component)]
+struct Gun {
+    timer: std::time::Duration,
+    interval: std::time::Duration,
+    bullet: Handle<Mesh>,
+    bullet_color: Handle<ColorMaterial>,
+}
+
+#[derive(Component)]
+struct Bullet;
+
+fn setup(
+    mut commands: Commands,
+    window: Single<&Window>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
     commands.spawn((
         Camera2d,
         Camera {
@@ -154,14 +186,21 @@ fn setup(mut commands: Commands, window: Single<&Window>) {
             ..OrthographicProjection::default_2d()
         }),
     ));
-    let mut rng = StdRng::from_seed(seed());
+    commands.spawn((
+        Title,
+        Mesh2d(meshes.add(Rectangle::from_size(VIEW_SIZE))),
+        MeshMaterial2d(materials.add(Color::hsva(0.0, 0.0, 0.0, 0.8))),
+        Transform::from_xyz(0.0, 0.0, 1.0),
+    ));
+}
+
+fn setup_loading_screen(mut random_source: ResMut<RandomSource>) {
     let initial_values = (0..FIELD_HEIGHT * FIELD_WIDTH)
-        .map(|_| rng.random())
+        .map(|_| random_source.0.random())
         .collect();
     AsyncComputeTaskPool::get()
         .spawn(generate_field(initial_values))
         .detach();
-    commands.insert_resource(RandomSource(rng));
 }
 
 fn update_camera(mut camera: Single<&mut Camera>, window: Single<&Window>) {
@@ -265,19 +304,6 @@ async fn generate_field(initial_values: Vec<[f32; 4]>) {
         })
         .collect();
     *FIELD.lock().unwrap() = Some(Field(field));
-}
-
-fn setup_loading_screen(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    commands.spawn((
-        Title,
-        Mesh2d(meshes.add(Rectangle::from_size(VIEW_SIZE))),
-        MeshMaterial2d(materials.add(Color::hsva(0.0, 0.0, 0.0, 0.8))),
-        Transform::from_xyz(0.0, 0.0, 1.0),
-    ));
 }
 
 fn update_loading_screen(mut commands: Commands) {
@@ -435,10 +461,17 @@ fn start(
         stroke_color: materials.add(Color::BLACK),
     });
 
-    commands.insert_resource(EnemiesBvh {
-        bvh: Bvh::new(),
+    commands.insert_resource(EnemiesBvh(Bvh::new()));
+    commands.insert_resource(EnemiesBvhOptimizer {
         workspace: BvhWorkspace::default(),
-        optimization_counter: 0,
+        counter: 0,
+    });
+
+    commands.spawn(Gun {
+        timer: std::time::Duration::ZERO,
+        interval: std::time::Duration::from_millis(400),
+        bullet: meshes.add(Circle::new(0.2)),
+        bullet_color: materials.add(Color::BLACK),
     });
 }
 
@@ -453,14 +486,9 @@ fn update_direction(
     }
 }
 
-fn calculate_direction(
-    window: &Window,
-    (camera, camera_transform): (&Camera, &GlobalTransform),
-) -> Option<Vec2> {
-    let cursor_position = window.cursor_position()?;
-    camera
-        .viewport_to_world_2d(camera_transform, cursor_position)
-        .ok()
+fn calculate_direction(window: &Window, camera: (&Camera, &GlobalTransform)) -> Option<Vec2> {
+    let cursor = window.cursor_position()?;
+    camera.0.viewport_to_world_2d(camera.1, cursor).ok()
 }
 
 fn move_player(
@@ -483,14 +511,33 @@ fn move_player(
     ));
 }
 
-fn update(
-    mut commands: Commands,
+fn update_player(
     mut next_state: ResMut<NextState<State>>,
-    mut enemies: Query<(Entity, &Enemy, &mut Transform), Without<PlayerTriangle>>,
-    mut enemies_bvh: ResMut<EnemiesBvh>,
-    mut player: ResMut<Player>,
-    player_triangles: Query<(&PlayerTriangle, &mut Transform), Without<Enemy>>,
-    player_velocity: Res<PlayerVelocity>,
+    player: Res<Player>,
+    player_triangles: Query<(&PlayerTriangle, &mut Transform)>,
+) {
+    let inner_radius = 1.0 - player.health / player.max_health;
+    for (PlayerTriangle(triangle, cos), mut transform) in player_triangles {
+        match triangle {
+            Triangle::Inner => {
+                transform.scale.x = 1.0 - inner_radius * cos;
+                transform.scale.y = inner_radius;
+            }
+            Triangle::Outer => {
+                transform.scale.x = cos - inner_radius;
+            }
+        }
+    }
+    if player.health <= 0.0 {
+        next_state.set(State::Result);
+        return;
+    }
+}
+
+fn move_enemies(
+    mut enemies: Query<(Entity, &Enemy, &mut Transform)>,
+    enemies_bvh: Res<EnemiesBvh>,
+    player: Res<PlayerVelocity>,
     time: Res<Time>,
 ) {
     for (entity, enemy, mut transform) in &mut enemies {
@@ -503,11 +550,11 @@ fn update(
             enemy_velocity *= player_distance_squared - radius * radius;
             enemy_velocity /= player_distance_squared;
         }
-        for other_index in enemies_bvh.bvh.intersect_aabb(&old_aabb) {
+        for other_index in enemies_bvh.0.intersect_aabb(&old_aabb) {
             if other_index == entity.index_u32() {
                 continue;
             }
-            let other_node = enemies_bvh.bvh.leaf_node(other_index).unwrap();
+            let other_node = enemies_bvh.0.leaf_node(other_index).unwrap();
             let other_radius = (other_node.maxs().x - other_node.mins().x) / 2.0;
             let sum_radii = radius + other_radius;
             let diff = old_pos - other_node.center();
@@ -516,13 +563,31 @@ fn update(
                 enemy_velocity += diff / enemy_distance_squared;
             }
         }
-        let new_pos = old_pos + (enemy_velocity - player_velocity.velocity) * time.delta_secs();
+        let new_pos = old_pos + (enemy_velocity - player.velocity) * time.delta_secs();
         transform.translation = new_pos.extend(0.0);
+    }
+}
+
+fn update_enemies(
+    mut commands: Commands,
+    mut enemies_bvh: ResMut<EnemiesBvh>,
+    mut enemies_bvh_optimizer: ResMut<EnemiesBvhOptimizer>,
+    mut player: ResMut<Player>,
+    enemies: Query<(Entity, &Enemy, &Transform)>,
+    time: Res<Time>,
+) {
+    enemies_bvh.0.refit(&mut enemies_bvh_optimizer.workspace);
+    enemies_bvh_optimizer.counter += 1;
+    if enemies_bvh_optimizer.counter > 10 {
+        enemies_bvh
+            .0
+            .optimize_incremental(&mut enemies_bvh_optimizer.workspace);
+        enemies_bvh_optimizer.counter = 0;
     }
     for (entity, enemy, transform) in &enemies {
         if enemy.health == 0 {
             commands.entity(entity).despawn();
-            enemies_bvh.bvh.remove(entity.index_u32());
+            enemies_bvh.0.remove(entity.index_u32());
         } else {
             let size = enemy.radius;
             let new_pos = transform.translation.truncate();
@@ -530,23 +595,7 @@ fn update(
                 player.health -= time.delta_secs();
             }
             let new_aabb = Aabb::new(new_pos - Vec2::splat(size), new_pos + Vec2::splat(size));
-            enemies_bvh.bvh.insert(new_aabb, entity.index_u32());
-        }
-    }
-    if player.health <= 0.0 {
-        next_state.set(State::Result);
-        return;
-    }
-    let inner_radius = 1.0 - player.health / player.max_health;
-    for (PlayerTriangle(triangle, cos), mut transform) in player_triangles {
-        match triangle {
-            Triangle::Inner => {
-                transform.scale.x = 1.0 - inner_radius * cos;
-                transform.scale.y = inner_radius;
-            }
-            Triangle::Outer => {
-                transform.scale.x = cos - inner_radius;
-            }
+            enemies_bvh.0.insert(new_aabb, entity.index_u32());
         }
     }
 }
@@ -572,10 +621,98 @@ fn spawn_enemies(
                 MeshMaterial2d(enemy_source.stroke_color.clone()),
                 Transform::from_translation(pos.extend(0.0)),
             ));
-            enemies_bvh.bvh.insert(
+            enemies_bvh.0.insert(
                 Aabb::new(pos - Vec2::splat(radius), pos + Vec2::splat(radius)),
                 entity.id().index_u32(),
             );
         }
     }
+}
+
+fn move_bullets(
+    mut commands: Commands,
+    bullets: Query<(Entity, &mut Transform), With<Bullet>>,
+    entities: &Entities,
+    enemies_bvh: Res<EnemiesBvh>,
+    player: Res<PlayerVelocity>,
+    time: Res<Time>,
+) {
+    for (bullet_entity, mut bullet_transform) in bullets {
+        let bullet_pos = bullet_transform.translation.truncate();
+        if let Some((enemy_index, (_, enemy_pos))) = enemies_bvh.0.find_best(
+            f32::MAX,
+            |node, _| node.aabb().distance_to_local_point(bullet_pos, true),
+            |index, _| {
+                let aabb = enemies_bvh.0.leaf_node(index).unwrap().aabb();
+                let center = aabb.center();
+                let radius = aabb.half_extents().x;
+                Some((center.distance(bullet_pos) - radius, center))
+            },
+        ) {
+            let relative_pos = enemy_pos - bullet_pos;
+            if relative_pos.length() < 1.0 {
+                let enemy_entity_index = EntityIndex::from_raw_u32(enemy_index).unwrap();
+                let enemy_entity = entities.resolve_from_index(enemy_entity_index);
+                commands.queue(move |world: &mut World| {
+                    if let Ok(mut enemy_entity_mut) = world.get_entity_mut(enemy_entity) {
+                        let mut enemy = enemy_entity_mut.get_mut::<Enemy>().unwrap();
+                        enemy.health = enemy.health.saturating_sub(10);
+                    }
+                    world.despawn(bullet_entity);
+                });
+            } else {
+                let bullet_velocity = 20.0 * relative_pos.normalize_or_zero();
+                bullet_transform.translation +=
+                    (time.delta_secs() * (bullet_velocity - player.velocity)).extend(0.0);
+            }
+        }
+    }
+}
+
+fn spawn_bullets(mut commands: Commands, guns: Query<&mut Gun>, time: Res<Time>) {
+    for mut gun in guns {
+        let mut time = gun.timer + time.delta();
+        while time >= gun.interval {
+            commands.spawn((
+                Bullet,
+                Mesh2d(gun.bullet.clone()),
+                MeshMaterial2d(gun.bullet_color.clone()),
+            ));
+            time -= gun.interval;
+        }
+        gun.timer = time;
+    }
+}
+
+fn setup_result_screen(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    commands.spawn((
+        Title,
+        Mesh2d(meshes.add(Rectangle::from_size(VIEW_SIZE))),
+        MeshMaterial2d(materials.add(Color::hsva(0.0, 0.0, 0.0, 0.8))),
+        Transform::from_xyz(0.0, 0.0, 1.0),
+    ));
+}
+
+fn update_result_screen(
+    mut mouse_button_inputs: MessageReader<bevy::input::mouse::MouseButtonInput>,
+    mut next_state: ResMut<NextState<State>>,
+) {
+    for input in mouse_button_inputs.read() {
+        if input.button == MouseButton::Left && input.state == bevy::input::ButtonState::Released {
+            next_state.set(State::Loading);
+        }
+    }
+}
+
+fn reset(mut commands: Commands) {
+    commands.despawn_all::<With<Sprite>>();
+    commands.despawn_all::<With<PlayerTriangle>>();
+    commands.despawn_all::<With<EnemySource>>();
+    commands.despawn_all::<With<Enemy>>();
+    commands.despawn_all::<With<Gun>>();
+    commands.despawn_all::<With<Bullet>>();
 }

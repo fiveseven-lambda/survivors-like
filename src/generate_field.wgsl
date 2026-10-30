@@ -17,7 +17,7 @@ fn main(
     let left = (column + WIDTH - 1) % WIDTH;
     let right = (column + 1) % WIDTH;
 
-    var next_cell = 10 * prev_cell;
+    var next_cell = 20 * prev_cell;
     next_cell += 4 * prev_field[above * WIDTH + column];
     next_cell += 4 * prev_field[below * WIDTH + column];
     next_cell += 4 * prev_field[row * WIDTH + left];
@@ -26,7 +26,7 @@ fn main(
     next_cell += prev_field[above * WIDTH + right];
     next_cell += prev_field[below * WIDTH + left];
     next_cell += prev_field[below * WIDTH + right];
-    next_cell /= 30;
+    next_cell /= 40;
 
     let xy = 0.3 * prev_cell.x * prev_cell.y * (prev_cell.x - prev_cell.y);
     let xz = 0.3 * prev_cell.x * prev_cell.z * (prev_cell.x - prev_cell.z);
