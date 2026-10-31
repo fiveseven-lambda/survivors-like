@@ -19,8 +19,8 @@ const FIELD_WIDTH: usize = FIELD_SIZE.x as usize;
 const FIELD_HEIGHT: usize = FIELD_SIZE.y as usize;
 const FIELD_GENERATION_STEPS: usize = 1024;
 const RESOURCE_COLORS: [Color; 4] = [
-    Color::hsv(60.0, 0.6, 0.8),
     Color::hsv(160.0, 0.6, 0.8),
+    Color::hsv(60.0, 0.6, 0.8),
     Color::hsv(220.0, 0.6, 0.8),
     Color::hsv(320.0, 0.6, 0.8),
 ];
@@ -63,6 +63,7 @@ pub fn app() {
         .add_systems(Update, spawn_enemies.run_if(in_state(State::Running)))
         .add_systems(Update, move_bullets.run_if(in_state(State::Running)))
         .add_systems(Update, spawn_bullets.run_if(in_state(State::Running)))
+        .add_systems(Update, update_counters.run_if(in_state(State::Running)))
         .add_systems(OnEnter(State::Result), setup_result_screen)
         .add_systems(Update, update_result_screen.run_if(in_state(State::Result)))
         .add_systems(OnExit(State::Result), reset)
@@ -122,18 +123,19 @@ struct PlayerVelocity {
 }
 
 #[derive(Resource)]
-struct PlayerPosition(Vec2);
-
-#[derive(Resource)]
 struct Player {
+    position: Vec2,
     health: f32,
     max_health: f32,
+    kill: f32,
+    resources: [f32; 4],
 }
 
 #[derive(Component)]
 struct EnemySource {
     radius: f32,
     health: u32,
+    reward: f32,
     timer: std::time::Duration,
     interval: std::time::Duration,
     stroke: Handle<Mesh>,
@@ -144,6 +146,7 @@ struct EnemySource {
 struct Enemy {
     radius: f32,
     health: u32,
+    reward: f32,
 }
 
 #[derive(Resource)]
@@ -165,6 +168,12 @@ struct Gun {
 
 #[derive(Component)]
 struct Bullet;
+
+#[derive(Component)]
+enum Counter {
+    Kill,
+    Resource(usize),
+}
 
 fn setup(
     mut commands: Commands,
@@ -407,6 +416,65 @@ fn setup_title_screen(
             scale: Vec2::splat(1.0 / 16.0).extend(1.0),
         },
     ));
+
+    commands.spawn((
+        Counter::Kill,
+        Mesh2d(meshes.add(Rectangle::new(4.0, 1.5))),
+        MeshMaterial2d(materials.add(Color::BLACK)),
+        Transform::from_translation(Vec3 {
+            x: 2.0 - VIEW_SIZE.x / 2.0,
+            y: VIEW_SIZE.y / 2.0 - 0.5,
+            z: 0.0,
+        }),
+    ));
+    commands.spawn((
+        Counter::Kill,
+        Text2d(String::from("0")),
+        TextFont {
+            font_size: FontSize::from(24.0),
+            ..default()
+        },
+        Transform {
+            translation: Vec3 {
+                x: 4.0 - VIEW_SIZE.x / 2.0,
+                y: VIEW_SIZE.y / 2.0 - 1.5,
+                z: 0.0,
+            },
+            rotation: Quat::IDENTITY,
+            scale: Vec2::splat(1.0 / 16.0).extend(0.0),
+        },
+        bevy::sprite::Anchor::BOTTOM_RIGHT,
+    ));
+    for (index, &color) in RESOURCE_COLORS.iter().enumerate() {
+        commands.spawn((
+            Counter::Resource(index),
+            Mesh2d(meshes.add(Rectangle::new(4.0, 1.5))),
+            MeshMaterial2d(materials.add(color)),
+            Transform::from_translation(Vec3 {
+                x: 2.0 - VIEW_SIZE.x / 2.0,
+                y: 1.0 + VIEW_SIZE.y / 2.0 - 1.5 * (index + 2) as f32,
+                z: 0.0,
+            }),
+        ));
+        commands.spawn((
+            Counter::Resource(index),
+            Text2d(String::from("0")),
+            TextFont {
+                font_size: FontSize::from(24.0),
+                ..default()
+            },
+            Transform {
+                translation: Vec3 {
+                    x: 4.0 - VIEW_SIZE.x / 2.0,
+                    y: VIEW_SIZE.y / 2.0 - 1.5 * (index + 2) as f32,
+                    z: 0.0,
+                },
+                rotation: Quat::IDENTITY,
+                scale: Vec2::splat(1.0 / 16.0).extend(1.0),
+            },
+            bevy::sprite::Anchor::BOTTOM_RIGHT,
+        ));
+    }
 }
 
 fn update_title_screen(
@@ -438,14 +506,17 @@ fn start(
         speed,
         velocity: direction.normalize_or(Vec2::X) * speed,
     });
-    commands.insert_resource(PlayerPosition(Vec2::ZERO));
     commands.insert_resource(Player {
+        position: Vec2::ZERO,
         health: 1.0,
         max_health: 1.0,
+        kill: 0.0,
+        resources: [0.0; 4],
     });
     commands.spawn(EnemySource {
         radius: 0.6,
         health: 20,
+        reward: 2.0,
         timer: std::time::Duration::ZERO,
         interval: std::time::Duration::from_millis(2000),
         stroke: meshes.add(Circle::new(0.6).to_ring(0.1)),
@@ -455,6 +526,7 @@ fn start(
     commands.spawn(EnemySource {
         radius: 0.4,
         health: 10,
+        reward: 1.0,
         timer: std::time::Duration::ZERO,
         interval: std::time::Duration::from_millis(500),
         stroke: meshes.add(Circle::new(0.4).to_ring(0.1)),
@@ -492,20 +564,25 @@ fn calculate_direction(window: &Window, camera: (&Camera, &GlobalTransform)) -> 
 }
 
 fn move_player(
-    mut player_position: ResMut<PlayerPosition>,
+    mut player: ResMut<Player>,
     mut background: Single<&mut Sprite>,
     player_velocity: Res<PlayerVelocity>,
+    field: Res<Field>,
     time: Res<Time>,
 ) {
-    let pos_float = player_position.0 + player_velocity.velocity * time.delta_secs();
+    let pos_float = player.position + player_velocity.velocity * time.delta_secs();
     let pos_int = pos_float.as_ivec2();
     let field_size = FIELD_SIZE.as_ivec2();
     let q = pos_int.div_euclid(field_size) * field_size;
-    player_position.0 = pos_float - q.as_vec2();
+    player.position = pos_float - q.as_vec2();
+    let IVec2 { x: column, y: row } = pos_int - q;
+    let row = (-row).rem_euclid(FIELD_HEIGHT as i32);
+    let cell = field.0[row as usize * FIELD_WIDTH + column as usize];
+    player.resources[cell as usize] += time.delta_secs();
     background.rect = Some(Rect::from_center_size(
         Vec2 {
-            x: player_position.0.x,
-            y: -player_position.0.y,
+            x: player.position.x,
+            y: -player.position.y,
         },
         VIEW_SIZE,
     ));
@@ -530,7 +607,6 @@ fn update_player(
     }
     if player.health <= 0.0 {
         next_state.set(State::Result);
-        return;
     }
 }
 
@@ -586,6 +662,7 @@ fn update_enemies(
     }
     for (entity, enemy, transform) in &enemies {
         if enemy.health == 0 {
+            player.kill += enemy.reward;
             commands.entity(entity).despawn();
             enemies_bvh.0.remove(entity.index_u32());
         } else {
@@ -612,11 +689,14 @@ fn spawn_enemies(
         let num_enemies = (time.as_nanos() / enemy_source.interval.as_nanos()) as u32;
         enemy_source.timer = time - num_enemies * enemy_source.interval;
         let radius = enemy_source.radius;
-        let health = enemy_source.health;
         for _ in 0..num_enemies {
             let pos = 40.0 * Vec2::from_angle(random_source.0.random_range(0.0..360.0));
             let entity = commands.spawn((
-                Enemy { radius, health },
+                Enemy {
+                    radius: enemy_source.radius,
+                    health: enemy_source.health,
+                    reward: enemy_source.reward,
+                },
                 Mesh2d(enemy_source.stroke.clone()),
                 MeshMaterial2d(enemy_source.stroke_color.clone()),
                 Transform::from_translation(pos.extend(0.0)),
@@ -708,6 +788,16 @@ fn update_result_screen(
     }
 }
 
+fn update_counters(resource_counter: Query<(&mut Text2d, &Counter)>, player: Res<Player>) {
+    for (mut text, counter) in resource_counter {
+        let value = match *counter {
+            Counter::Kill => player.kill,
+            Counter::Resource(index) => player.resources[index],
+        };
+        text.0 = value.floor().to_string();
+    }
+}
+
 fn reset(mut commands: Commands) {
     commands.despawn_all::<With<Sprite>>();
     commands.despawn_all::<With<PlayerTriangle>>();
@@ -715,4 +805,5 @@ fn reset(mut commands: Commands) {
     commands.despawn_all::<With<Enemy>>();
     commands.despawn_all::<With<Gun>>();
     commands.despawn_all::<With<Bullet>>();
+    commands.despawn_all::<With<Counter>>();
 }
